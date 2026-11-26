@@ -15,6 +15,7 @@ Env vars:
     DRY_RUN=1        build the video but do not upload
     PRIVACY=private  private | unlisted | public
     STORY_GENRE      e.g. "moral story", "horror story", "motivational story"
+    GROQ_MODEL       optional: force a specific Groq model
 """
 import asyncio
 import datetime
@@ -48,7 +49,6 @@ L = LANGS[LANG]
 
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 PRIVACY = os.getenv("PRIVACY", "private")
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GENRE = os.getenv("STORY_GENRE", "short scary horror story with a twist ending (spooky, no gore, no violence)")
 FPS = 30
 TODAY = datetime.date.today().isoformat()
@@ -145,6 +145,34 @@ def clean_tags(tags):
     return out[:10]
 
 
+BAD_MODEL_WORDS = ("whisper", "tts", "guard", "orpheus", "playai", "safeguard", "embed")
+PREFERRED_MODELS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
+]
+
+
+def model_candidates(client):
+    """Ask Groq which models this key can use, best first."""
+    try:
+        avail = [m.id for m in client.models.list().data]
+    except Exception as e:
+        print("Could not list Groq models:", str(e)[:200])
+        avail = []
+    avail = [m for m in avail if not any(b in m.lower() for b in BAD_MODEL_WORDS)]
+    out = []
+    if os.getenv("GROQ_MODEL"):
+        out.append(os.environ["GROQ_MODEL"])
+    out += [m for m in PREFERRED_MODELS if m in avail and m not in out]
+    out += [m for m in avail if m not in out]
+    if not out:
+        out = PREFERRED_MODELS[:]
+    return out
+
+
 def make_story(titles, tags):
     from groq import Groq
 
@@ -166,21 +194,26 @@ def make_story(titles, tags):
         f"(English visual description of that scene, same characters described the same way in "
         f"every scene, no text in the image).\n"
     )
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.9,
-                response_format={"type": "json_object"},
-            )
-            data = json.loads(resp.choices[0].message.content)
-            assert len(data["scenes"]) >= 4
-            data["hashtags"] = clean_tags(data.get("hashtags", []))
-            return data
-        except Exception as e:
-            print(f"Groq attempt {attempt + 1} failed:", e)
-            time.sleep(4)
+    for model in model_candidates(client)[:8]:
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.9,
+                    response_format={"type": "json_object"},
+                )
+                data = json.loads(resp.choices[0].message.content)
+                assert len(data["scenes"]) >= 4
+                data["hashtags"] = clean_tags(data.get("hashtags", []))
+                print("Story written with Groq model:", model)
+                return data
+            except Exception as e:
+                msg = str(e)
+                print(f"Groq {model} attempt {attempt + 1} failed:", msg[:300])
+                if "not_found" in msg or "404" in msg or "decommission" in msg.lower():
+                    break  # this model is gone, try the next one
+                time.sleep(4)
     raise SystemExit("Could not get a story from Groq")
 
 
